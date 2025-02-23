@@ -184,6 +184,7 @@ from datasets import load_dataset
 import json
 from collections import defaultdict
 import numpy as np
+import torch.nn.functional as F
 
 
 # --------------------- Configuration ---------------------
@@ -259,86 +260,69 @@ class OCRCollator:
 
 # --------------------- Model Architecture ---------------------
 class CRNN(nn.Module):
-    def __init__(self, num_chars):
-        super().__init__()
-
-        # CNN Feature Extractor
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(64),
-            nn.MaxPool2d(2, 2),  # 32x128
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(128),
-            nn.MaxPool2d(2, 2),  # 16x64
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(256),
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(256),
-            nn.MaxPool2d((2, 2)),  # 8x32
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(512),
-            nn.MaxPool2d((1, 2)),  # 8x16
-            nn.Conv2d(512, 512, (3, 2)),
-            nn.ReLU(),  # 6x15
-            nn.BatchNorm2d(512),
-        )
-        self.rnn_input_size = 512 * 6  # 512 channels * 6 height
-
-        # RNN Sequence Model
-        self.rnn = nn.LSTM(
-            input_size=self.rnn_input_size,  # Changed from 512 to 512*6
-            hidden_size=256,
-            num_layers=2,
-            bidirectional=True,
-            dropout=0.3,
-            batch_first=False,
-        )
-
-        # Output Layer
-        self.fc = nn.Linear(512, num_chars)
-        self.softmax = nn.LogSoftmax(dim=2)
-
-        # Weight initialization
-        self._init_weights()
-
-    def _init_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    module.weight, mode="fan_out", nonlinearity="relu"
-                )
-            elif isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                nn.init.constant_(module.bias, 0)
-            elif isinstance(module, nn.LSTM):
-                for name, param in module.named_parameters():
-                    if "weight_ih" in name:
-                        nn.init.xavier_normal_(param)
-                    elif "weight_hh" in name:
-                        nn.init.orthogonal_(param)
-                    elif "bias" in name:
-                        nn.init.constant_(param, 0)
-
+    def __init__(self, num_classes):
+        super(CRNN, self).__init__()
+        
+        # Convolutional layers
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=(3, 3), padding=1)
+        self.pool1 = nn.MaxPool2d(kernel_size=(2, 2), stride=2)
+        
+        self.conv2 = nn.Conv2d(64, 128, kernel_size=(3, 3), padding=1)
+        self.pool2 = nn.MaxPool2d(kernel_size=(2, 2), stride=2)
+        
+        self.conv3 = nn.Conv2d(128, 256, kernel_size=(3, 3), padding=1)
+        self.conv4 = nn.Conv2d(256, 256, kernel_size=(3, 3), padding=1)
+        self.pool4 = nn.MaxPool2d(kernel_size=(2, 1))
+        
+        self.conv5 = nn.Conv2d(256, 512, kernel_size=(3, 3), padding=1)
+        self.batch_norm5 = nn.BatchNorm2d(512)
+        
+        self.conv6 = nn.Conv2d(512, 512, kernel_size=(3, 3), padding=1)
+        self.batch_norm6 = nn.BatchNorm2d(512)
+        self.pool6 = nn.MaxPool2d(kernel_size=(2, 1))
+        
+        self.conv7 = nn.Conv2d(512, 512, kernel_size=(2, 2))
+        
+        # Bidirectional LSTM layers
+        self.lstm1 = nn.LSTM(512, 128, bidirectional=True, batch_first=True, dropout=0.2)
+        self.lstm2 = nn.LSTM(256, 128, bidirectional=True, batch_first=True, dropout=0.2)
+        
+        # Fully connected layer
+        self.fc = nn.Linear(256, num_classes)
+    
     def forward(self, x):
-        # CNN
-        x = self.cnn(x)  # (B, C, H, W)
-
-        # Reshape for RNN
-        b, c, h, w = x.size()
-        x = x.view(b, c * h, w).permute(2, 0, 1)  # (W, B, C*H)
-
-        # RNN
-        x, _ = self.rnn(x)  # (seq_len, batch, hidden_size * 2)
-
-        # Output
-        x = self.fc(x)  # (seq_len, batch, num_chars)
-        return self.softmax(x)
-
+        # Convolutional layers
+        x = F.relu(self.conv1(x))
+        x = self.pool1(x)
+        
+        x = F.relu(self.conv2(x))
+        x = self.pool2(x)
+        
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
+        x = self.pool4(x)
+        
+        x = F.relu(self.conv5(x))
+        x = self.batch_norm5(x)
+        
+        x = F.relu(self.conv6(x))
+        x = self.batch_norm6(x)
+        x = self.pool6(x)
+        
+        x = F.relu(self.conv7(x))
+        
+        # Squeeze the height dimension
+        x = x.squeeze(2)  # Squeeze the height dimension (axis=2 in PyTorch)
+        x = x.permute(0, 2, 1)  # Change shape to (batch, width, channels)
+        
+        # Bidirectional LSTM layers
+        x, _ = self.lstm1(x)
+        x, _ = self.lstm2(x)
+        
+        # Fully connected layer
+        x = self.fc(x)
+        
+        return F.log_softmax(x, dim=2)
 
 # --------------------- Training Utilities ---------------------
 class CTCLossWrapper(nn.CTCLoss):
