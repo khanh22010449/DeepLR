@@ -1,19 +1,25 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
-from torchvision.transforms import Compose, Normalize, ToTensor, Resize, Grayscale, RandomRotation, RandomAffine
-
+from torchvision.transforms import (
+    Compose,
+    Normalize,
+    ToTensor,
+    Resize,
+    Grayscale,
+    RandomRotation,
+    RandomAffine,
+    RandomPerspective
+)
 from datasets import load_dataset
 from torch.utils.data import DataLoader
-
 import json
 import ast
 
 
 def load_data():
     dataset = load_dataset("MohamedExperio/ICDAR2019")
-    # Tạo tập ký tự
+    # Tạo tập các ký tự từ ground truth
     chars = set()
     for sample in dataset["train"]["ground_truth"]:
         gt = json.loads(sample["gt_parses"][0])
@@ -25,103 +31,100 @@ def load_data():
     
     char2idx = {char: idx for idx, char in enumerate(sorted(total_chars))}
     idx2char = {idx: char for char, idx in char2idx.items()}
-
     num_classes = len(total_chars)
     
-    # Áp dụng data augmentation
-    transform = Compose(
-        [
-            Resize((32, 128)),
-            Grayscale(num_output_channels=1),
-            RandomRotation(degrees=2),  # xoay nhẹ để tăng tính đa dạng
-            RandomAffine(degrees=0, translate=(0.02, 0.02)),  # dịch chuyển nhẹ
-            ToTensor(),
-            Normalize(mean=[0.5], std=[0.5]),
-        ]
-    )
+    # Data augmentation: thêm RandomRotation, RandomAffine và RandomPerspective
+    transform = Compose([
+        Resize((32, 128)),
+        Grayscale(num_output_channels=1),
+        RandomRotation(degrees=2),  # xoay nhẹ
+        RandomAffine(degrees=0, translate=(0.02, 0.02)),  # dịch chuyển nhẹ
+        RandomPerspective(distortion_scale=0.05, p=0.5),  # hiệu ứng phối cảnh nhẹ
+        ToTensor(),
+        Normalize(mean=[0.5], std=[0.5])
+    ])
 
     def apply_transforms(batch):
         batch["image"] = [transform(img) for img in batch["image"]]
         return batch
 
     dataset = dataset.with_transform(apply_transforms)
-
-    trainloader = DataLoader(
-        dataset["train"], batch_size=32, shuffle=True
-    )
-
+    trainloader = DataLoader(dataset["train"], batch_size=32, shuffle=True)
     valloader = DataLoader(dataset["validation"], batch_size=32)
     testloader = DataLoader(dataset["test"], batch_size=32)
     return trainloader, valloader, testloader, num_classes, char2idx, idx2char
 
 
 class CRNN(nn.Module):
-    def __init__(self, num_classes, dropout_rate=0.2):
+    def __init__(self, num_classes, dropout_rate=0.3):
         super(CRNN, self).__init__()
-        
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(1, 64, kernel_size=3, padding=1)
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.conv2 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.conv3 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
-        self.conv4 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
-        self.pool4 = nn.MaxPool2d(kernel_size=(2, 1))
-        
-        self.conv5 = nn.Conv2d(256, 512, kernel_size=3, padding=1)
-        self.batch_norm5 = nn.BatchNorm2d(512)
-        
-        self.conv6 = nn.Conv2d(512, 512, kernel_size=3, padding=1)
-        self.batch_norm6 = nn.BatchNorm2d(512)
-        self.pool6 = nn.MaxPool2d(kernel_size=(2, 1))
-        
-        self.conv7 = nn.Conv2d(512, 512, kernel_size=2)
-        self.dropout_conv = nn.Dropout2d(dropout_rate)
-        
-        # Bidirectional LSTM layers
-        # LSTM có dropout giữa các lớp (áp dụng nếu num_layers > 1)
-        self.lstm1 = nn.LSTM(512, 128, bidirectional=True, batch_first=True, dropout=dropout_rate)
-        self.lstm2 = nn.LSTM(256, 128, bidirectional=True, batch_first=True, dropout=dropout_rate)
-        self.dropout_lstm = nn.Dropout(dropout_rate)
-        
-        # Fully connected layer
-        self.fc = nn.Linear(256, num_classes)
-    
+        # Sử dụng các block convolution theo dạng Sequential để tăng khả năng trích xuất đặc trưng
+        self.conv_block1 = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+        )
+        self.conv_block2 = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+        )
+        self.conv_block3 = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True)
+        )
+        self.conv_block4 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1))
+        )
+        self.conv_block5 = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True)
+        )
+        self.conv_block6 = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d((2, 1))
+        )
+        self.conv_block7 = nn.Sequential(
+            nn.Conv2d(512, 512, kernel_size=2, stride=1, padding=0),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout_rate)
+        )
+        # Sau các conv layers, loại bỏ chiều height và hoán đổi thứ tự các chiều cho LSTM
+        # Sử dụng 2 lớp LSTM song hướng để xử lý chuỗi
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=256,
+            num_layers=2,
+            bidirectional=True,
+            batch_first=True,
+            dropout=dropout_rate
+        )
+        # Fully-connected mapping từ 512 (256*2) đến số lớp ký tự
+        self.fc = nn.Linear(512, num_classes)
+
     def forward(self, x):
-        # Convolutional layers
-        x = F.relu(self.conv1(x))
-        x = self.pool1(x)
-        
-        x = F.relu(self.conv2(x))
-        x = self.pool2(x)
-        
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = self.pool4(x)
-        
-        x = F.relu(self.conv5(x))
-        x = self.batch_norm5(x)
-        
-        x = F.relu(self.conv6(x))
-        x = self.batch_norm6(x)
-        x = self.pool6(x)
-        
-        x = F.relu(self.conv7(x))
-        x = self.dropout_conv(x)
-        
-        # Squeeze chiều height và đổi thứ tự các chiều: (batch, width, channels)
-        x = x.squeeze(2)
-        x = x.permute(0, 2, 1)
-        
-        # Bidirectional LSTM layers
-        x, _ = self.lstm1(x)
-        x, _ = self.lstm2(x)
-        x = self.dropout_lstm(x)
-        
+        x = self.conv_block1(x)
+        x = self.conv_block2(x)
+        x = self.conv_block3(x)
+        x = self.conv_block4(x)
+        x = self.conv_block5(x)
+        x = self.conv_block6(x)
+        x = self.conv_block7(x)
+        # Giả sử chiều height sau conv layers bằng 1, loại bỏ chiều này
+        x = x.squeeze(2)  # (batch, channels, width)
+        x = x.permute(0, 2, 1)  # (batch, width, channels)
+        x, _ = self.lstm(x)
         x = self.fc(x)
-        
         return F.log_softmax(x, dim=2)
 
 
@@ -129,7 +132,6 @@ def process_ground_truth(batch_gt, char2idx):
     """Chuyển đổi ground truth sang các chỉ số số học"""
     all_targets = []
     all_lengths = []
-
     gt_parses_list = batch_gt["gt_parses"]
 
     for item in gt_parses_list:
@@ -154,13 +156,14 @@ def process_ground_truth(batch_gt, char2idx):
     return torch.IntTensor(all_targets), torch.IntTensor(all_lengths)
 
 
-def train(net, trainloader, epochs, device, lr=0.001, clip=5.0):
+def train(net, trainloader, epochs, device, lr=0.001, clip=5.0, weight_decay=1e-5):
     net.to(device)
-    # Sử dụng CTCLoss với blank token
+    # CTCLoss với blank token
     blank_idx = char2idx["<BLANK>"]
     criterion = nn.CTCLoss(blank=blank_idx, reduction='mean', zero_infinity=True)
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=weight_decay)
+    # Sử dụng CosineAnnealingLR để điều chỉnh learning rate
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     net.train()
 
     for epoch in range(epochs):
@@ -174,10 +177,10 @@ def train(net, trainloader, epochs, device, lr=0.001, clip=5.0):
             optimizer.zero_grad()
             outputs = net(images)  # outputs có shape (batch, sequence_length, num_classes)
 
-            # Sử dụng outputs.size(1) là chiều sequence
+            # Chiều sequence được lấy từ outputs.size(1)
             input_lengths = torch.full(
-                size=(images.size(0),), 
-                fill_value=outputs.size(1), 
+                size=(images.size(0),),
+                fill_value=outputs.size(1),
                 dtype=torch.long
             ).to(device)
 
@@ -187,9 +190,7 @@ def train(net, trainloader, epochs, device, lr=0.001, clip=5.0):
                 input_lengths,
                 target_lengths
             )
-
             loss.backward()
-            # Áp dụng gradient clipping
             torch.nn.utils.clip_grad_norm_(net.parameters(), clip)
             optimizer.step()
             running_loss += loss.item()
@@ -202,7 +203,7 @@ def train(net, trainloader, epochs, device, lr=0.001, clip=5.0):
 # Usage example
 if __name__ == "__main__":
     trainloader, valloader, testloader, num_classes, char2idx, idx2char = load_data()
-    net = CRNN(num_classes, dropout_rate=0.2)
+    net = CRNN(num_classes, dropout_rate=0.3)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
-    train(net, trainloader, epochs=100, device=device, lr=0.001)
+    train(net, trainloader, epochs=100, device=device, lr=0.001, clip=5.0, weight_decay=1e-5)
